@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8">
+<button id="pay">Pay ₹<span id="amt"></span></button>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+(async () => {
+  const r = await fetch('/pay/create-order', {method:'POST'});
+  const o = await r.json();
+  document.getElementById('amt').textContent = (o.amount/100).toFixed(0);
+  document.getElementById('pay').onclick = () => {
+    const rz = new Razorpay({
+      key: o.key_id,
+      amount: o.amount,
+      currency: o.currency,
+      order_id: o.order_id,
+      name: "Photo Review",
+      description: "One-time improvement",
+      handler: async function (resp) {
+        const v = await fetch('/pay/verify', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(resp)
+        });
+        const {token} = await v.json();
+        // store and redirect to UI
+        sessionStorage.setItem('paid_token', token);
+        location.href = '/';
+      }
+    });
+    rz.open();
+  };
+})();
+</script>

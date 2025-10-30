@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+requests==2.32.3
+replicate==0.34.1
+streamlit==1.38.0
+python-dotenv==1.0.1
+openai==1.51.2
+httpx<0.28

@@ -1,0 +1,9 @@
+.env
+.env.*
+uploads/
+__pycache__/
+*.secret
+*.key
+*credentials*.json
+*gcp*.json
+*_sa.json
