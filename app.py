@@ -1,112 +1,216 @@
 # app.py
-import os, uuid, mimetypes, traceback
+import os
+import uuid
+import json
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from typing import List
 
-from schemas import AnalyzeResponse, ProcessResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+
+# service hooks already in your repo
+# these should remain unchanged:
+# - services.openai_review.evaluate_image(image_url: str) -> dict (analysis JSON)
+# - services.nanobanana_client.improve_photo(image_url: str, guidance_text: str) -> str (improved image URL)
+from services.openai_review import evaluate_image
 from services.nanobanana_client import improve_photo
-from services.gcs_client import upload_bytes_and_sign
 
-# load env from project root
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+# Storage adapter constants
+STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "local").lower()
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+# for signed URLs
+GCS_SIGNED_EXPIRES = int(os.getenv("GCS_SIGNED_EXPIRES", "3600"))
 
-# choose review provider
-if os.getenv("REVIEW_PROVIDER", "replicate").lower() == "openai":
-    from services.openai_review import evaluate_image
-else:
-    from services.replicate_client import evaluate_image
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = FastAPI(title="Photo Review MVP")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Photo review & improve API")
 
-def save_to_gcs_and_sign(f: UploadFile) -> dict:
-    ext = (f.filename.split(".")[-1] or "jpg").lower()
-    key = f"uploads/{uuid.uuid4().hex}.{ext}"
-    content = f.file.read()
-    ctype = mimetypes.guess_type(f"file.{ext}")[0] or "application/octet-stream"
-    gs_uri, signed = upload_bytes_and_sign(content, key, ctype, expires_sec=3600)
-    return {"key": key, "gs_uri": gs_uri, "signed_url": signed}
 
-@app.get("/")
-def root():
-    return {"status": "ok", "endpoints": ["/analyze", "/process", "/docs", "/_debug_env", "/_preflight_url"]}
+# mount local uploads for dev
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-@app.get("/_debug_env")
-def _debug_env():
-    import os.path
-    return {
-        "REVIEW_PROVIDER": os.getenv("REVIEW_PROVIDER"),
-        "REVIEW_MODEL": os.getenv("REVIEW_MODEL"),
-        "OPENAI_KEY_len": len(os.getenv("OPENAI_API_KEY", "")),
-        "REPLICATE_TOKEN_len": len(os.getenv("REPLICATE_API_TOKEN", "")),
-        "GCS_BUCKET": os.getenv("GCS_BUCKET"),
-        "CREDS_exists": os.path.isfile(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")),
+
+# --- Storage helpers ------------------------------------------------------
+def _local_save_file(file: UploadFile) -> str:
+    """Save file to uploads/ and return local path (filename)."""
+    ext = Path(file.filename).suffix or ".jpg"
+    fname = f"{uuid.uuid4().hex}{ext}"
+    out_path = Path(UPLOAD_DIR) / fname
+    with out_path.open("wb") as f:
+        f.write(file.file.read())
+    return fname
+
+
+def _local_public_url(request: Request, fname: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/uploads/{fname}"
+
+
+def _gcs_signed_upload_url(filename: str, expires: int = 3600) -> str:
+    """
+    Create a signed URL to PUT an object into GCS.
+    Imports google.cloud only when needed so dev environment without GCS SDK works.
+    """
+    from google.cloud import storage
+    from google.auth.transport import requests as google_requests
+
+    client = storage.Client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(filename)
+
+    # generate_signed_url for PUT (method='PUT') depends on library version.
+    url = blob.generate_signed_url(
+        expiration=expires,
+        method="PUT",
+        content_type="application/octet-stream",
+    )
+    return url
+
+
+def _gcs_public_url(filename: str) -> str:
+    return f"https://storage.googleapis.com/{GCS_BUCKET}/{filename}"
+
+
+async def save_upload_and_get_url(request: Request, file: UploadFile) -> str:
+    """
+    Unified save function. Returns a public URL (or signed URL depending on provider).
+    - local: saves to uploads/ and returns http://<host>/uploads/<file>
+    - gcs: uploads bytes to bucket and return public URL (or signed URL if configured)
+    """
+    if STORAGE_PROVIDER == "local":
+        fname = _local_save_file(file)
+        return _local_public_url(request, fname)
+
+    if STORAGE_PROVIDER == "gcs":
+        # when using GCS choose either direct signed upload or server-side upload
+        # server-side upload:
+        from google.cloud import storage
+
+        data = await file.read()
+        ext = Path(file.filename).suffix or ".jpg"
+        dest_path = f"uploads/{uuid.uuid4().hex}{ext}"
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(dest_path)
+        blob.upload_from_string(data, content_type=file.content_type or "image/jpeg")
+
+        if os.getenv("GCS_SIGNED_URL", "false").lower() == "true":
+            # return a signed GET url
+            return blob.generate_signed_url(expiration=GCS_SIGNED_EXPIRES)
+
+        return _gcs_public_url(dest_path)
+
+    raise HTTPException(status_code=500, detail="Unsupported STORAGE_PROVIDER")
+
+
+# --- Preflight endpoint for direct client -> GCS uploads ------------------
+@app.post("/_preflight_url")
+async def preflight_url(request: Request, file: UploadFile = File(...)):
+    """
+    Returns a signed PUT url and gs_uri for the caller to upload directly to GCS.
+    Only works when STORAGE_PROVIDER=gcs.
+    Client should then PUT the file bytes to signed_url.
+    """
+    if STORAGE_PROVIDER != "gcs":
+        # for local dev, behave like a normal upload and return local public URL
+        fname = _local_save_file(file)
+        return {"signed_url": _local_public_url(request, fname), "gs_uri": None}
+
+    # generate a dest object path and signed PUT url
+    ext = Path(file.filename).suffix or ".jpg"
+    dest_path = f"uploads/{uuid.uuid4().hex}{ext}"
+    signed_url = _gcs_signed_upload_url(dest_path, expires=GCS_SIGNED_EXPIRES)
+    gs_uri = f"gs://{GCS_BUCKET}/{dest_path}"
+    return {"signed_url": signed_url, "gs_uri": gs_uri}
+
+
+# --- Analyze endpoint ----------------------------------------------------
+@app.post("/analyze")
+async def analyze(request: Request, files: List[UploadFile] = File(...)):
+    """
+    Analyze images only. Returns structured analysis JSON.
+    """
+    items = []
+    for f in files:
+        try:
+            public_url = await save_upload_and_get_url(request, f)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"save failed: {e}")
+
+        # call the review model (LLM with vision)
+        try:
+            analysis = evaluate_image(public_url)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"review failed: {e}")
+
+        items.append({"filename": f.filename, "image_url": public_url, "feedback": analysis})
+
+    overall = {
+        # Simplified overall structure. If evaluate_image returns a bigger structure, adapt accordingly.
+        "items_count": len(items)
     }
 
-@app.post("/_preflight_url")
-async def _preflight_url(file: UploadFile = File(...)):
-    try:
-        saved = save_to_gcs_and_sign(file)
-        return {"signed_url": saved["signed_url"], "gs_uri": saved["gs_uri"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"preflight failed: {e}")
+    return JSONResponse({"analysis": {"items": items, "overall": overall}})
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(files: list[UploadFile] = File(...)):
-    try:
-        items = []
-        for f in files[:3]:
-            saved = save_to_gcs_and_sign(f)
-            image_url = saved["signed_url"]  # HTTPS signed URL for model fetch
-            feedback = evaluate_image(image_url)
-            items.append({"filename": f.filename, "image_url": image_url, "feedback": feedback})
 
-        best = max(items, key=lambda x: sum(x["feedback"]["score"].values()) / 4)
-        overall = {
-            "main_dp_choice": best["feedback"]["photo_title"],
-            "main_dp_choice_url": best["image_url"],
-            "action_points": best["feedback"]["action_points"],
-            "suggested_order": [i["filename"] for i in items],
-        }
-        return {"items": items, "overall": overall}
-    except Exception as e:
-        print("[analyze error]", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"analyze failed: {e}")
+# --- Process endpoint: analyze + improve ---------------------------------
+@app.post("/process")
+async def process(request: Request, files: List[UploadFile] = File(...)):
+    """
+    Runs analyze then improvement. Returns analysis + improvements with improved URLs.
+    """
+    analysis_items = []
+    improvements = []
 
-@app.post("/process", response_model=ProcessResponse)
-async def process(files: list[UploadFile] = File(...)):
-    try:
-        analysis = await analyze(files)
-        improvements = []
-        for item in analysis["items"]:
-            red = item["feedback"]["red_flags"]
-            acts = item["feedback"].get("action_points", [])
-            guidance = ", ".join(red + acts)[:600]
-            try:
-                improved_url = improve_photo(item["image_url"], guidance) or ""
-                improvements.append({
-                    "filename": item["filename"],
-                    "original_url": item["image_url"],
-                    "improved_url": improved_url,
-                    "prompt_used": guidance,
-                })
-            except Exception as e:
-                improvements.append({
-                    "filename": item["filename"],
-                    "original_url": item["image_url"],
-                    "improved_url": "",
-                    "prompt_used": guidance,
-                    "error": f"nanobanana_failed: {e}",
-                })
-        return {"analysis": analysis, "improvements": improvements}
-    except Exception as e:
-        print("[process fatal]", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"process failed: {e}")
+    for f in files:
+        try:
+            public_url = await save_upload_and_get_url(request, f)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"save failed: {e}")
 
+        # 1) Analyze
+        try:
+            analysis = evaluate_image(public_url)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"review failed: {e}")
+
+        analysis_items.append({"filename": f.filename, "image_url": public_url, "feedback": analysis})
+
+        # 2) Improve using the image improver (Replicate model)
+        guidance_text = " ".join(analysis.get("overall_suggestions", [])) if isinstance(analysis, dict) else ""
+        try:
+            improved_url = improve_photo(public_url, guidance_text)
+            improvements.append({
+                "filename": f.filename,
+                "original_url": public_url,
+                "improved_url": improved_url,
+                "prompt_used": guidance_text
+            })
+        except Exception as e:
+            improvements.append({
+                "filename": f.filename,
+                "original_url": public_url,
+                "improved_url": None,
+                "error": str(e),
+                "prompt_used": guidance_text
+            })
+
+    overall = {"items_count": len(analysis_items)}
+    return JSONResponse({"analysis": {"items": analysis_items, "overall": overall}, "improvements": improvements})
+
+
+# --- Debug endpoint (optional) -------------------------------------------
+@app.get("/_debug_env")
+def debug_env():
+    # Do not expose secrets in production. This is for quick debug only.
+    safe = {k: ("***" if k.lower().find("key") >= 0 or k.lower().find("token") >= 0 else v)
+            for k, v in os.environ.items() if k.startswith(("REPLICATE", "OPENAI", "GCS", "STORAGE", "RAZORPAY"))}
+    return {"provider": STORAGE_PROVIDER, "gcs_bucket": GCS_BUCKET, "env": safe}
+
+
+# If run directly for local dev
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8001)), reload=True)
