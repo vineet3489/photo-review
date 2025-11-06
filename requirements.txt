@@ -8,3 +8,6 @@ streamlit==1.38.0
 python-dotenv==1.0.1
 openai==1.51.2
 httpx<0.28
+google-cloud-storage>=2.11.0
+google-auth>=2.22.0
+google-auth-oauthlib>=1.0.0
